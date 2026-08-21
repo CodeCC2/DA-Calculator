@@ -345,33 +345,291 @@
       return new Date(ms).toLocaleDateString(state.lang === 'th' ? 'th-TH' : 'en-GB', {day:'numeric', month:'short', year:'numeric'});
     }
 
-    // ZZZ major-version release boundaries (UTC+8 release dates).
-    // Deadly Assault was introduced in Version 1.4, so the timeline starts there.
-    const ZZZ_PATCH_TIMELINE = [
-      ['3.1', Date.parse('2026-07-29T00:00:00+08:00')],
-      ['3.0', Date.parse('2026-06-17T00:00:00+08:00')],
-      ['2.8', Date.parse('2026-05-06T00:00:00+08:00')],
-      ['2.7', Date.parse('2026-03-24T00:00:00+08:00')],
-      ['2.6', Date.parse('2026-02-06T00:00:00+08:00')],
-      ['2.5', Date.parse('2025-12-30T00:00:00+08:00')],
-      ['2.4', Date.parse('2025-11-26T00:00:00+08:00')],
-      ['2.3', Date.parse('2025-10-15T00:00:00+08:00')],
-      ['2.2', Date.parse('2025-09-04T00:00:00+08:00')],
-      ['2.1', Date.parse('2025-07-16T00:00:00+08:00')],
-      ['2.0', Date.parse('2025-06-06T00:00:00+08:00')],
-      ['1.7', Date.parse('2025-04-23T00:00:00+08:00')],
-      ['1.6', Date.parse('2025-03-12T00:00:00+08:00')],
-      ['1.5', Date.parse('2025-01-22T00:00:00+08:00')],
-      ['1.4', Date.parse('2024-12-18T00:00:00+08:00')],
+    // Fallback ZZZ patch boundaries. These keep the site working offline or when
+    // HoYoLAB blocks browser-side requests. Newer patch boundaries are merged in
+    // automatically from official ZZZ Update Announcement posts when available.
+    const ZZZ_PATCH_FALLBACK_TIMELINE = [
+      ['3.1', Date.parse('2026-07-29T06:00:00+08:00')],
+      ['3.0', Date.parse('2026-06-17T06:00:00+08:00')],
+      ['2.8', Date.parse('2026-05-06T06:00:00+08:00')],
+      ['2.7', Date.parse('2026-03-24T06:00:00+08:00')],
+      ['2.6', Date.parse('2026-02-06T06:00:00+08:00')],
+      ['2.5', Date.parse('2025-12-30T06:00:00+08:00')],
+      ['2.4', Date.parse('2025-11-26T06:00:00+08:00')],
+      ['2.3', Date.parse('2025-10-15T06:00:00+08:00')],
+      ['2.2', Date.parse('2025-09-04T06:00:00+08:00')],
+      ['2.1', Date.parse('2025-07-16T06:00:00+08:00')],
+      ['2.0', Date.parse('2025-06-06T06:00:00+08:00')],
+      ['1.7', Date.parse('2025-04-23T06:00:00+08:00')],
+      ['1.6', Date.parse('2025-03-12T06:00:00+08:00')],
+      ['1.5', Date.parse('2025-01-22T06:00:00+08:00')],
+      ['1.4', Date.parse('2024-12-18T06:00:00+08:00')],
     ];
+
+    let ZZZ_PATCH_TIMELINE = [...ZZZ_PATCH_FALLBACK_TIMELINE];
+    let officialPatchRanges = [];
+    let officialPatchRefreshPromise = null;
+    const PATCH_CALENDAR_CACHE_KEY = 'zzz-official-patch-calendar-v1';
+    const PATCH_CALENDAR_CACHE_TTL = 6 * 60 * 60 * 1000;
+
+    function normalizePatchVersion(value) {
+      const match = String(value || '').match(/(?:^|\b)(\d+)\.(\d+)(?:\.\d+)?(?:\b|$)/);
+      return match ? `${Number(match[1])}.${Number(match[2])}` : '';
+    }
+
+    function htmlToPlainText(value) {
+      const raw = String(value || '');
+      if (!raw) return '';
+      try {
+        const doc = new DOMParser().parseFromString(raw, 'text/html');
+        return String(doc.body?.textContent || raw).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      } catch (_) {
+        return raw
+          .replace(/<br\s*\/?>/gi, '\n')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/&nbsp;/gi, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+    }
+
+    function parseUtc8DateMatch(match) {
+      if (!match) return NaN;
+      const [,y,m,d,hh='06',mm='00'] = match;
+      const iso = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}T${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}:00+08:00`;
+      return Date.parse(iso);
+    }
+
+    function extractOfficialPatchRange(subject, content) {
+      const title = htmlToPlainText(subject);
+      const body = htmlToPlainText(content);
+      const version = normalizePatchVersion(title);
+      if (!version || !/\bVersion\b/i.test(title)) return null;
+
+      const startMatch =
+        body.match(/(?:Update Start Time|Version Update Time)[\s\S]{0,220}?(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?\s*(?:\(UTC\+8\))?/i) ||
+        body.match(/(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})\s+(\d{1,2}):(\d{2})\s*\(UTC\+8\)/i);
+
+      const start = parseUtc8DateMatch(startMatch);
+      if (!Number.isFinite(start)) return null;
+
+      let end = NaN;
+      const endMatch =
+        body.match(/(?:ending on|ends? on|until)[\s\S]{0,80}?(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?\s*(?:\(UTC\+8\))?/i);
+      if (endMatch) end = parseUtc8DateMatch(endMatch);
+
+      if (!Number.isFinite(end)) {
+        const durationMatch = body.match(/(?:run|last)\s+for\s+(\d{1,3})\s+days/i);
+        const days = Number(durationMatch?.[1]);
+        if (Number.isFinite(days) && days > 0 && days < 100) end = start + days * 86400000;
+      }
+
+      return {version, start, end:Number.isFinite(end) ? end : null};
+    }
+
+    function mergeOfficialPatchRanges(ranges) {
+      if (!Array.isArray(ranges) || !ranges.length) return false;
+
+      const clean = ranges
+        .map(row => ({
+          version: normalizePatchVersion(row?.version),
+          start: Number(row?.start),
+          end: row?.end == null ? null : Number(row.end),
+          postId: row?.postId ? String(row.postId) : '',
+        }))
+        .filter(row => row.version && Number.isFinite(row.start))
+        .sort((a,b) => b.start - a.start);
+
+      if (!clean.length) return false;
+
+      const byVersion = new Map(ZZZ_PATCH_FALLBACK_TIMELINE.map(([version,start]) => [version, start]));
+      for (const row of clean) byVersion.set(row.version, row.start);
+
+      ZZZ_PATCH_TIMELINE = [...byVersion.entries()]
+        .filter(([,start]) => Number.isFinite(start))
+        .sort((a,b) => b[1] - a[1]);
+
+      officialPatchRanges = clean;
+      return true;
+    }
+
+    function hydrateOfficialPatchCalendarCache() {
+      try {
+        const cached = JSON.parse(localStorage.getItem(PATCH_CALENDAR_CACHE_KEY) || 'null');
+        if (!cached || !Array.isArray(cached.ranges)) return false;
+        return mergeOfficialPatchRanges(cached.ranges);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function writeOfficialPatchCalendarCache(ranges) {
+      try {
+        localStorage.setItem(PATCH_CALENDAR_CACHE_KEY, JSON.stringify({
+          fetchedAt: Date.now(),
+          ranges,
+        }));
+      } catch (_) {}
+    }
+
+    function officialPatchCacheIsFresh() {
+      try {
+        const cached = JSON.parse(localStorage.getItem(PATCH_CALENDAR_CACHE_KEY) || 'null');
+        return Number.isFinite(Number(cached?.fetchedAt)) &&
+          Date.now() - Number(cached.fetchedAt) < PATCH_CALENDAR_CACHE_TTL &&
+          Array.isArray(cached?.ranges) &&
+          cached.ranges.length > 0;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    async function fetchJsonWithTimeout(url, timeoutMs=5000) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, {
+          method:'GET',
+          mode:'cors',
+          credentials:'omit',
+          cache:'no-store',
+          signal:controller.signal,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return await res.json();
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    async function fetchOfficialPatchRangesFromHoyolab() {
+      const bases = [
+        'https://bbs-api-os.hoyolab.com',
+        'https://bbs-api-os-static.hoyolab.com',
+      ];
+
+      let listJson = null;
+      let workingBase = '';
+
+      for (const base of bases) {
+        try {
+          const url = `${base}/community/post/wapi/getNewsList?gids=8&type=1&page_size=50`;
+          const json = await fetchJsonWithTimeout(url, 5000);
+          if (Number(json?.retcode) === 0 && Array.isArray(json?.data?.list)) {
+            listJson = json;
+            workingBase = base;
+            break;
+          }
+        } catch (err) {
+          console.warn('Official ZZZ notice list unavailable from', base, err);
+        }
+      }
+
+      if (!listJson) throw new Error('HoYoLAB official notice API unavailable');
+
+      const candidates = listJson.data.list
+        .map(item => {
+          const post = item?.post?.post || item?.post || item;
+          return {
+            postId:String(post?.post_id || ''),
+            subject:String(post?.subject || ''),
+            preview:String(post?.content || post?.structured_content || ''),
+          };
+        })
+        .filter(item => item.postId && /\bVersion\s+\d+\.\d+\b/i.test(item.subject))
+        .slice(0, 12);
+
+      const ranges = [];
+
+      for (const item of candidates) {
+        let content = item.preview;
+        try {
+          const fullUrl = `${workingBase}/community/post/wapi/getPostFull?post_id=${encodeURIComponent(item.postId)}`;
+          const full = await fetchJsonWithTimeout(fullUrl, 5000);
+          const post = full?.data?.post?.post;
+          if (post) content = String(post.content || post.structured_content || content || '');
+        } catch (err) {
+          console.warn('Official ZZZ notice detail unavailable:', item.postId, err);
+        }
+
+        const parsed = extractOfficialPatchRange(item.subject, content);
+        if (!parsed) continue;
+        ranges.push({...parsed, postId:item.postId});
+      }
+
+      const deduped = new Map();
+      for (const row of ranges) {
+        const prev = deduped.get(row.version);
+        if (!prev || row.start > prev.start || (!prev.end && row.end)) deduped.set(row.version, row);
+      }
+
+      return [...deduped.values()].sort((a,b) => b.start - a.start);
+    }
+
+    async function refreshOfficialPatchCalendar() {
+      hydrateOfficialPatchCalendarCache();
+      if (officialPatchCacheIsFresh()) return false;
+      if (officialPatchRefreshPromise) return officialPatchRefreshPromise;
+
+      officialPatchRefreshPromise = (async () => {
+        try {
+          const ranges = await fetchOfficialPatchRangesFromHoyolab();
+          if (!ranges.length) return false;
+          const changed = mergeOfficialPatchRanges(ranges);
+          if (changed) {
+            writeOfficialPatchCalendarCache(ranges);
+            console.info('ZZZ patch calendar updated from official HoYoLAB notices:', ranges);
+          }
+          return changed;
+        } catch (err) {
+          // This path is expected on browsers/networks where HoYoLAB does not
+          // allow cross-origin requests. The fallback timeline remains active.
+          console.warn('Official ZZZ patch calendar unavailable; using cached/fallback dates.', err);
+          return false;
+        } finally {
+          officialPatchRefreshPromise = null;
+        }
+      })();
+
+      return officialPatchRefreshPromise;
+    }
 
     function patchVersionForSeason(season) {
       if (!season || !Number.isFinite(season.start)) return '';
 
-      // Patch labels are based ONLY on the Season start date.
-      // Do not use Nanoka's beta/latest data-source version here:
-      // a future DA/Shiyu rotation can be stored in beta data while its
-      // actual start date still belongs to the current live patch.
+      // Exact official ranges win when the browser could fetch them.
+      for (const range of officialPatchRanges) {
+        if (season.start >= range.start && (!Number.isFinite(range.end) || season.start < range.end)) {
+          return range.version;
+        }
+      }
+
+      // If the current official announcement tells us when the live patch ends,
+      // a beta Season after that boundary belongs to Nanoka's latest/beta patch.
+      // This avoids the old bug where every beta row was labeled zzz.latest:
+      // e.g. 28 Aug 2026 stays 3.1 because it is before the 3.1 end boundary.
+      if (season.isBeta && officialPatchRanges.length) {
+        const newestOfficial = [...officialPatchRanges].sort((a,b) => b.start-a.start)[0];
+        const betaPatch = normalizePatchVersion(state.betaVersion);
+        const livePatch = normalizePatchVersion(state.liveVersion);
+        if (
+          Number.isFinite(Number(newestOfficial?.end)) &&
+          season.start >= Number(newestOfficial.end) &&
+          betaPatch &&
+          betaPatch !== livePatch
+        ) {
+          return betaPatch;
+        }
+      }
+
+      // Once a new patch has already gone live, the actual current Season can
+      // safely use Nanoka's live version even before our fallback table knows it.
+      if (String(season.id || '') === String(state.currentSeasonId || '')) {
+        const livePatch = normalizePatchVersion(state.liveVersion);
+        if (livePatch) return livePatch;
+      }
+
+      // Historical/offline fallback.
       for (const [version, releaseAt] of ZZZ_PATCH_TIMELINE) {
         if (season.start >= releaseAt) return version;
       }
@@ -1099,6 +1357,14 @@
 
         state.historyCache.clear();
         renderSeasonPicker();
+
+        // Browser-only automatic patch calendar update. Do not block DA/Shiyu
+        // data loading if HoYoLAB is slow or rejects CORS.
+        refreshOfficialPatchCalendar().then(changed => {
+          if (!changed || isStale()) return;
+          renderSeasonPicker();
+          updateSeasonInfo();
+        }).catch(() => {});
 
         await loadSeasonById(current.id, 'normal', {token:requestToken, type:requestType});
         if (isStale()) return;
@@ -2073,6 +2339,7 @@
       });
     });
 
+    hydrateOfficialPatchCalendarCache();
     applyStaticTranslations();
     addTeam('Team A', 25000, DEFAULT_TIME);
     addTeam('Team B', 30000, DEFAULT_TIME);
