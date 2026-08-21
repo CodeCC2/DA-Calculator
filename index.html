@@ -530,6 +530,7 @@
       historyCache: new Map(),
       historyScanToken: 0,
       resistanceLookupToken: 0,
+      dataLoadToken: 0,
       lang: (localStorage.getItem('zzzDaLang') === 'en' ? 'en' : 'th'),
       lastHistoryRender: null,
       endgameType: (localStorage.getItem('zzzEndgameMode') === 'shiyu' ? 'shiyu' : 'da'),
@@ -605,7 +606,19 @@
     }
 
     async function switchEndgameMode(type) {
-      if (!['da','shiyu'].includes(type) || type===state.endgameType) return;
+      if (!['da','shiyu'].includes(type)) return;
+
+      // Clicking the already-selected mode with no data behaves like Refresh Data.
+      if (type===state.endgameType) {
+        if (!state.bosses.length) await loadNanoka();
+        return;
+      }
+
+      // Invalidate any DA/Shiyu request that was still running before the switch.
+      // The new load below receives a newer token, so stale responses can no
+      // longer overwrite the newly selected mode.
+      state.dataLoadToken += 1;
+
       state.endgameType=type;
       localStorage.setItem('zzzEndgameMode',type);
       state.version=null; state.liveVersion=null; state.betaVersion=null; state.activeSeasonVersion=null;
@@ -614,8 +627,10 @@
       state.selectedBossIndex=-1; state.historyCache.clear(); state.lastHistoryRender=null; state.historyScanToken+=1; state.resistanceLookupToken+=1;
       applyStaticTranslations(); renderModeSwitch(); renderBosses(); updateSeasonInfo();
       if (els.historyModeSelect) els.historyModeSelect.value='normal';
-      if (els.historyContent) els.historyContent.innerHTML=`<div class="history-empty"><strong>${escapeHtml(t('historyEmptyTitle'))}</strong>${escapeHtml(shiyu ? t('shiyuHistoryEmptyDesc') : t('historyEmptyDesc'))}</div>`;
-      setHistoryStatus(shiyu ? tr('เลือกบอสแล้วกด “สแกนย้อนหลังทั้งหมด”','Select a boss and click “Scan all history”') : t('historyReady'));
+      if (els.historyContent) els.historyContent.innerHTML=`<div class="history-empty"><strong>${escapeHtml(t('historyEmptyTitle'))}</strong>${escapeHtml(isShiyuMode() ? t('shiyuHistoryEmptyDesc') : t('historyEmptyDesc'))}</div>`;
+      setHistoryStatus(isShiyuMode() ? tr('เลือกบอสแล้วกด “สแกนย้อนหลังทั้งหมด”','Select a boss and click “Scan all history”') : t('historyReady'));
+
+      // Switching mode now always performs the same fresh data load as Refresh Data.
       await loadNanoka();
     }
 
@@ -1364,55 +1379,97 @@
       void enrichBossResistanceData();
     }
 
-    async function loadSeasonById(seasonId, preferredMode='normal') {
-      if (!state.version || !seasonId) return;
+    async function loadSeasonById(seasonId, preferredMode='normal', loadContext=null) {
+      if (!state.version || !seasonId) return false;
       const id = String(seasonId);
-      setStatus('', state.lang==='th' ? `กำลังโหลด ${isShiyuMode()?'Shiyu':'DA'} ${id}…` : `Loading ${isShiyuMode()?'Shiyu':'DA'} ${id}…`);
+      const requestType = loadContext?.type || state.endgameType;
+      const isStale = () => Boolean(loadContext) && (
+        loadContext.token !== state.dataLoadToken ||
+        state.endgameType !== requestType
+      );
+
+      setStatus('', state.lang==='th' ? `กำลังโหลด ${requestType==='shiyu'?'Shiyu':'DA'} ${id}…` : `Loading ${requestType==='shiyu'?'Shiyu':'DA'} ${id}…`);
       els.seasonSelect.disabled = true;
       if (els.seasonTrigger) els.seasonTrigger.disabled = true;
       closeSeasonMenu();
+
       try {
         const seasonRow = state.seasons.find(x => x.id === id) || null;
         const version = seasonRow?.version || state.version;
-        const detail = await fetchSeasonDetailCached(version, id, state.endgameType);
+        const detail = await fetchSeasonDetailCached(version, id, requestType);
+
+        // A user may have switched DA ↔ Shiyu while the detail request was in flight.
+        if (isStale()) return false;
+
         await applySeasonDetail(id, detail, preferredMode);
+        if (isStale()) return false;
+
         const isCurrent = id === state.currentSeasonId;
         const isBeta = seasonRow?.isBeta === true;
-        const hardData = !isShiyuMode() && Boolean(state.modes.hard);
+        const hardData = requestType!=='shiyu' && Boolean(state.modes.hard);
         const kind = isBeta ? 'Beta' : (isCurrent ? t('currentData') : t('historicalData'));
         setStatus('ok', `${kind} · ${version} · ${id}${hardData ? ' · Hard ✓' : ''}`);
         showError('');
+        return true;
       } catch (err) {
+        if (isStale()) return false;
         console.error(err);
-        setStatus('err', state.lang==='th' ? `โหลด ${isShiyuMode()?'Shiyu':'DA'} ${id} ไม่สำเร็จ` : `Failed to load ${isShiyuMode()?'Shiyu':'DA'} ${id}`);
+        setStatus('err', state.lang==='th' ? `โหลด ${requestType==='shiyu'?'Shiyu':'DA'} ${id} ไม่สำเร็จ` : `Failed to load ${requestType==='shiyu'?'Shiyu':'DA'} ${id}`);
         showError(state.lang==='th' ? `โหลด Season ${id} ไม่สำเร็จ: ${err.message || err}` : `Failed to load Season ${id}: ${err.message || err}`);
         throw err;
       } finally {
-        els.seasonSelect.disabled = false;
-        if (els.seasonTrigger) els.seasonTrigger.disabled = false;
+        // Only the currently active foreground load may re-enable these controls.
+        if (!isStale()) {
+          els.seasonSelect.disabled = false;
+          if (els.seasonTrigger) els.seasonTrigger.disabled = false;
+        }
       }
     }
 
     async function loadNanoka() {
+      const requestType = state.endgameType;
+      const requestToken = ++state.dataLoadToken;
+      const isStale = () => (
+        requestToken !== state.dataLoadToken ||
+        state.endgameType !== requestType
+      );
+
       setStatus('', t('loading'));
       showError('');
       els.refreshBtn.disabled = true;
+
       try {
         const manifest = await fetchJson(`${NANOKA}/manifest.json`);
+        if (isStale()) return;
+
         const zzz = manifest.zzz || {};
         const liveVersion = zzz.live || zzz.latest;
         const betaVersion = zzz.latest || liveVersion;
         if (!liveVersion) throw new Error(tr('manifest ไม่มี zzz.live / zzz.latest','manifest has no zzz.live / zzz.latest'));
 
-        const indexKind=endgameIndexKind();
+        const indexKind = requestType === 'shiyu' ? 'shiyu' : 'boss';
         const liveIndex = await fetchJson(`${NANOKA}/zzz/${encodeURIComponent(liveVersion)}/${indexKind}.json`);
+        if (isStale()) return;
+
         let betaIndex = null;
         if (betaVersion && betaVersion !== liveVersion) {
-          try { betaIndex = await fetchJson(`${NANOKA}/zzz/${encodeURIComponent(betaVersion)}/${indexKind}.json`); }
-          catch (err) { console.warn(`Beta ${endgameLabel()} index unavailable`, err); }
+          try {
+            betaIndex = await fetchJson(`${NANOKA}/zzz/${encodeURIComponent(betaVersion)}/${indexKind}.json`);
+          } catch (err) {
+            if (!isStale()) console.warn(`Beta ${requestType==='shiyu'?'Shiyu Defense':'Deadly Assault'} index unavailable`, err);
+          }
         }
+        if (isStale()) return;
+
         const current = chooseCurrentSeason(liveIndex);
-        if (!current) throw new Error(isShiyuMode() ? tr('หา Shiyu Defense Critical Node ปัจจุบันไม่เจอ','Current Shiyu Defense Critical Node season not found') : tr('หา Deadly Assault season ปัจจุบันไม่เจอ','Current Deadly Assault season not found'));
+        if (!current) {
+          throw new Error(requestType==='shiyu'
+            ? tr('หา Shiyu Defense Critical Node ปัจจุบันไม่เจอ','Current Shiyu Defense Critical Node season not found')
+            : tr('หา Deadly Assault season ปัจจุบันไม่เจอ','Current Deadly Assault season not found'));
+        }
+
+        // From this point on, only the latest mode/load is allowed to update state.
+        if (isStale()) return;
 
         state.version = liveVersion;
         state.liveVersion = liveVersion;
@@ -1422,6 +1479,7 @@
         state.seasonIndex = liveIndex;
         state.seasons = mergeLiveAndBetaSeasons(liveIndex, liveVersion, betaIndex, betaVersion);
         state.currentSeasonId = String(current.id);
+
         // Ensure the season chosen as current is always present in the selector,
         // even if another internal ID shares exactly the same publish window.
         if (!state.seasons.some(x => x.id === state.currentSeasonId)) {
@@ -1431,13 +1489,19 @@
           else state.seasons.push(currentRow);
           state.seasons.sort((a,b)=>b.start-a.start || Number(b.id)-Number(a.id));
         }
+
         state.historyCache.clear();
         renderSeasonPicker();
-        await loadSeasonById(current.id, 'normal');
+
+        await loadSeasonById(current.id, 'normal', {token:requestToken, type:requestType});
+        if (isStale()) return;
       } catch (err) {
+        // Ignore errors from a request belonging to a mode that is no longer active.
+        if (isStale()) return;
+
         console.error(err);
         state.source = 'fallback';
-        state.rates = isShiyuMode() ? [] : FALLBACK_RATES;
+        state.rates = requestType === 'shiyu' ? [] : FALLBACK_RATES;
         state.bosses = [];
         state.modes = {normal:null, hard:null};
         state.activeMode = 'normal';
@@ -1448,13 +1512,16 @@
         renderModeSwitch();
         setStatus('err', t('loadFailed'));
         setSource('Manual fallback');
-        showError(isShiyuMode() ? tr(`โหลดข้อมูล Shiyu ไม่สำเร็จ: ${err.message || err}`,`Failed to load Shiyu data: ${err.message || err}`) : tr(`โหลดข้อมูลอัตโนมัติไม่สำเร็จ: ${err.message || err} — ยังใช้โหมดกรอก Max HP เองด้านล่างได้`,`Automatic data load failed: ${err.message || err} — you can still use manual Max HP mode below.`));
+        showError(requestType === 'shiyu'
+          ? tr(`โหลดข้อมูล Shiyu ไม่สำเร็จ: ${err.message || err}`,`Failed to load Shiyu data: ${err.message || err}`)
+          : tr(`โหลดข้อมูลอัตโนมัติไม่สำเร็จ: ${err.message || err} — ยังใช้โหมดกรอก Max HP เองด้านล่างได้`,`Automatic data load failed: ${err.message || err} — you can still use manual Max HP mode below.`));
         renderBosses();
         updateSeasonInfo();
         refreshHistoryBossOptions();
         calculate();
       } finally {
-        els.refreshBtn.disabled = false;
+        // An older request must never unlock/overwrite UI owned by a newer request.
+        if (!isStale()) els.refreshBtn.disabled = false;
       }
     }
 
